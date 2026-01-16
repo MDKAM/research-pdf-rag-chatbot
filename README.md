@@ -1,13 +1,11 @@
----
-title: Pdf Rag Chatbot
-emoji: 📊
-colorFrom: pink
-colorTo: purple
-sdk: gradio
-sdk_version: 6.3.0
-app_file: app.py
-pinned: false
-license: mit
----
+# Research PDF RAG Chatbot (v0)
 
-Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
+A GenAI project:
+- Gradio UI on Hugging Face Spaces
+
+## Local run (lightweight)
+```bash
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python app.py
