@@ -535,6 +535,13 @@ with gr.Blocks(title="Research PDF RAG Chatbot (Ticket 5)") as demo:
     store_state = gr.State(None)
     rate_state = gr.State([])
 
+    access_code = gr.Textbox(
+        label="Access code (required for LLM features)",
+        type="password",
+        placeholder="Ask Mohammad for the code",
+    )
+
+
     with gr.Tabs():
         with gr.Tab("Upload PDF(s)"):
             pdfs = gr.File(label="Upload PDFs", file_types=[".pdf"], file_count="multiple", type="filepath")
@@ -560,7 +567,6 @@ with gr.Blocks(title="Research PDF RAG Chatbot (Ticket 5)") as demo:
 
         with gr.Tab("Ask"):
             gr.Markdown(api_key_status())
-            access_code = gr.Textbox(label="Access code (required for LLM)", type="password", placeholder="Ask Mohammad for the code")
             provider = gr.Dropdown(["auto", "groq", "gemini"], value="auto", label="LLM provider")
             with gr.Row():
                 groq_model = gr.Textbox(label="Groq model", value=GROQ_DEFAULT_MODEL)
@@ -580,7 +586,6 @@ with gr.Blocks(title="Research PDF RAG Chatbot (Ticket 5)") as demo:
                 "**Evaluation uses Gemini-only** to avoid Groq free-tier rate limits.\n\n"
                 "Edit `eval/golden.json` to match your uploaded PDFs for meaningful results."
             )
-            access_code = gr.Textbox(label="Access code (required for LLM)", type="password", placeholder="Ask Mohammad for the code")
             golden_path = gr.Textbox(label="Golden set path", value="eval/golden.json")
             btn_eval = gr.Button("Run evaluation", variant="primary")
             eval_out = gr.Markdown("No eval run yet.")
