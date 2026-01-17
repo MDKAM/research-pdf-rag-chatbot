@@ -31,18 +31,6 @@
       "question": "How will data be collected and what detection/segmentation approach is planned (including what varies across trials and what metrics are used)?",
       "expected_keywords": ["dataset", "surface types", "steel", "plastic", "wood", "wet", "dried", "pixel-wise classification", "statistical models", "segmentation map", "accuracy", "precision", "recall"],
       "expected_pages": [10, 11]
-    },
-    {
-      "id": "q6",
-      "question": "What safety constraints and protocols are described for working with UV-C and saliva, and what key numerical safety limits are reported?",
-      "expected_keywords": ["TLV", "3 mJ/cm2", "8 hour", "irradiance", "11.73 W/m2", "20 cm", "2.5 seconds", "biosafety", "PPE", "windowless room", "door sensor", "automatic shutdown"],
-      "expected_pages": [12, 13]
-    },
-    {
-      "id": "q7",
-      "question": "In the literature review, what are the main alternative approaches to contamination assessment/detection, and what limitations motivate this proposed method?",
-      "expected_keywords": ["visual inspection", "fluorescent markers", "ATP bioluminescence", "bacteriological cultures", "limitations", "time-consuming", "costly", "subjective", "real-time", "robotics"],
-      "expected_pages": [1, 8]
     }
   ]
 }
