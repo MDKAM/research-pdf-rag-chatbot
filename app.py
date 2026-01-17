@@ -24,33 +24,43 @@ from ragpdf.chunking import (
     ChunkingError,
 )
 
+from ragpdf.vectorstore import (
+    build_faiss_index,
+    retrieve,
+    VectorStoreError,
+    RetrievedChunk,
+)
+
 # ----------------------------
 # Guardrails (cost & stability)
 # ----------------------------
 MAX_FILE_SIZE_MB = 25
 MAX_PAGES_PER_PDF = 60
-MAX_TOTAL_CHARS = 800_000  # across ALL uploaded PDFs in one session
+MAX_TOTAL_CHARS = 800_000
 MAX_PASTE_CHARS = 200_000
 
 MAX_CHUNKS = 1200
+MAX_QUERY_CHARS = 2000
+
+# Embedding model defaults (HF)
+EMBEDDING_MODELS = [
+    "sentence-transformers/all-MiniLM-L6-v2",
+    "intfloat/e5-small-v2",
+]
 
 
 def _records_to_preview(records: List[PageRecord], max_chars: int = 4000) -> str:
-    out = []
-    used = 0
+    out, used = [], 0
     for r in records[:8]:
         header = f"\n\n=== {r.doc_name} | page {r.page} ===\n"
         body = (r.text or "").strip()
         snippet = body[:800] + ("…" if len(body) > 800 else "")
-        chunk = header + (snippet if snippet else "[no text found on this page]")
-        if used + len(chunk) > max_chars:
+        block = header + (snippet if snippet else "[no text found on this page]")
+        if used + len(block) > max_chars:
             break
-        out.append(chunk)
-        used += len(chunk)
-
-    if not out:
-        return "No extracted text to preview yet."
-    return "".join(out).strip()
+        out.append(block)
+        used += len(block)
+    return ("".join(out).strip()) if out else "No extracted text to preview yet."
 
 
 def _records_to_stats(records: List[PageRecord], elapsed_s: float) -> str:
@@ -65,13 +75,15 @@ def _records_to_stats(records: List[PageRecord], elapsed_s: float) -> str:
         if tlen > 0:
             nonempty_pages += 1
 
-    lines = []
-    lines.append(f"✅ Extraction complete in {elapsed_s:.2f}s")
-    lines.append(f"- Pages extracted: {sum(docs.values())} across {len(docs)} document(s)")
-    lines.append(f"- Non-empty pages: {nonempty_pages}")
-    lines.append(f"- Total extracted characters: {total_chars:,}")
-    lines.append(f"- Guardrails: {MAX_FILE_SIZE_MB}MB/file, {MAX_PAGES_PER_PDF} pages/PDF, {MAX_TOTAL_CHARS:,} chars total")
-    lines.append("\nPer-document page counts:")
+    lines = [
+        f"✅ Extraction complete in {elapsed_s:.2f}s",
+        f"- Pages extracted: {sum(docs.values())} across {len(docs)} document(s)",
+        f"- Non-empty pages: {nonempty_pages}",
+        f"- Total extracted characters: {total_chars:,}",
+        f"- Guardrails: {MAX_FILE_SIZE_MB}MB/file, {MAX_PAGES_PER_PDF} pages/PDF, {MAX_TOTAL_CHARS:,} chars total",
+        "",
+        "Per-document page counts:",
+    ]
     for k, v in docs.items():
         lines.append(f"  - {k}: {v} page(s)")
     return "\n".join(lines)
@@ -85,19 +97,20 @@ def _chunks_to_stats(chunks: List[ChunkRecord], elapsed_s: float) -> str:
         docs[c.doc_name] += 1
         total_chars += len(c.text)
 
-    lines = []
-    lines.append(f"✅ Chunking complete in {elapsed_s:.2f}s")
-    lines.append(f"- Total chunks: {len(chunks)} (max {MAX_CHUNKS})")
-    lines.append(f"- Total chunk characters: {total_chars:,}")
-    lines.append("\nChunks per document:")
+    lines = [
+        f"✅ Chunking complete in {elapsed_s:.2f}s",
+        f"- Total chunks: {len(chunks)} (max {MAX_CHUNKS})",
+        f"- Total chunk characters: {total_chars:,}",
+        "",
+        "Chunks per document:",
+    ]
     for k, v in docs.items():
         lines.append(f"  - {k}: {v} chunks")
     return "\n".join(lines)
 
 
 def _chunks_to_preview(chunks: List[ChunkRecord], max_chars: int = 5000) -> str:
-    out = []
-    used = 0
+    out, used = [], 0
     for c in chunks[:8]:
         header = f"\n\n=== {c.chunk_id} | {c.doc_name} | pages {c.page_start}-{c.page_end} ===\n"
         snippet = c.text[:900] + ("…" if len(c.text) > 900 else "")
@@ -109,10 +122,23 @@ def _chunks_to_preview(chunks: List[ChunkRecord], max_chars: int = 5000) -> str:
     return ("".join(out).strip()) if out else "No chunks to preview yet."
 
 
+def _retrieval_to_markdown(results: List[RetrievedChunk]) -> str:
+    if not results:
+        return "No results."
+
+    lines = ["### Top retrieved chunks (for citations later)\n"]
+    for r in results:
+        snippet = (r.text[:350] + "…") if len(r.text) > 350 else r.text
+        lines.append(
+            f"**{r.rank}.** score={r.score:.4f} | `{r.chunk_id}` | **{r.doc_name}** p{r.page_start}-{r.page_end}\n\n"
+            f"> {snippet.replace('\n', ' ')}\n"
+        )
+    return "\n".join(lines).strip()
+
+
 def load_pdfs(filepaths: List[str], existing: List[Dict[str, Any]] | None):
     try:
         t0 = time.time()
-
         validate_uploads(filepaths, max_file_size_mb=MAX_FILE_SIZE_MB)
 
         all_records: List[PageRecord] = []
@@ -155,8 +181,7 @@ def load_pasted_text(text: str):
     if len(text) > MAX_PASTE_CHARS:
         text = text[:MAX_PASTE_CHARS]
 
-    doc_id = "pasted"
-    rec = PageRecord(doc_id=doc_id, doc_name="pasted_text", page=1, text=text)
+    rec = PageRecord(doc_id="pasted", doc_name="pasted_text", page=1, text=text)
     stored = [rec.__dict__]
     stats = (
         "✅ Text loaded.\n"
@@ -197,24 +222,74 @@ def run_chunking(
         return [], f"❌ Unexpected error: {e}", "No preview available."
 
 
+def build_index(chunks: List[Dict[str, Any]], model_name: str):
+    if not chunks:
+        return None, "❌ No chunks found. Run chunking first."
+
+    try:
+        t0 = time.time()
+        store = build_faiss_index(
+            chunks=chunks,
+            model_name=model_name,
+            batch_size=32,
+            max_chunks=MAX_CHUNKS,
+        )
+        elapsed = time.time() - t0
+        msg = (
+            "✅ FAISS index built.\n"
+            f"- Model: {store['model_name']}\n"
+            f"- Dim: {store['dim']}\n"
+            f"- Vectors: {store['index'].ntotal}\n"
+            f"- Time: {elapsed:.2f}s\n"
+            f"- Similarity: cosine (via inner product on L2-normalized vectors)\n"
+        )
+        return store, msg
+    except VectorStoreError as e:
+        return None, f"❌ Index build error: {e}"
+    except Exception as e:
+        return None, f"❌ Unexpected error: {e}"
+
+
+def run_retrieval(store: Dict[str, Any] | None, query: str, top_k: int):
+    query = (query or "").strip()
+    if len(query) > MAX_QUERY_CHARS:
+        query = query[:MAX_QUERY_CHARS]
+
+    if not query:
+        return "❌ Please enter a query."
+
+    try:
+        t0 = time.time()
+        results = retrieve(store=store or {}, query=query, top_k=int(top_k))
+        elapsed = time.time() - t0
+        md = _retrieval_to_markdown(results)
+        md += f"\n\n_⏱ retrieval time: {elapsed:.2f}s | top_k={int(top_k)}_"
+        return md
+    except VectorStoreError as e:
+        return f"❌ Retrieval error: {e}"
+    except Exception as e:
+        return f"❌ Unexpected error: {e}"
+
+
 def clear_session():
-    return [], [], "Cleared.", "No extracted text to preview yet.", "No chunks to preview yet."
+    return [], [], None, "Cleared.", "No extracted text to preview yet.", "No chunks to preview yet.", "Index cleared.", "No results."
 
 
-with gr.Blocks(title="Research PDF RAG Chatbot (Ticket 2)") as demo:
+with gr.Blocks(title="Research PDF RAG Chatbot (Ticket 3)") as demo:
     gr.Markdown(
         """
 # Research PDF RAG Chatbot
 ✅ Ticket 1: PDF/text ingestion with page numbers  
 ✅ Ticket 2: Chunking with stable chunk IDs + page ranges  
+✅ Ticket 3: Embeddings + FAISS + retrieval UI  
 
-Next: embeddings → FAISS → retrieval.
+Next: Ticket 4 adds LLM answering + citations.
 """
     )
 
-    # State: page records and chunk records
-    records_state = gr.State([])  # list of {doc_id, doc_name, page, text}
-    chunks_state = gr.State([])   # list of {chunk_id, doc_id, doc_name, page_start, page_end, text}
+    records_state = gr.State([])   # page records
+    chunks_state = gr.State([])    # chunk records
+    store_state = gr.State(None)   # FAISS store (python object)
 
     with gr.Tabs():
         with gr.Tab("Upload PDF(s)"):
@@ -229,11 +304,7 @@ Next: embeddings → FAISS → retrieval.
                 btn_clear = gr.Button("Clear session")
 
         with gr.Tab("Paste text"):
-            pasted = gr.Textbox(
-                label="Paste text",
-                lines=12,
-                placeholder="Paste paper abstract, notes, or any text here…",
-            )
+            pasted = gr.Textbox(label="Paste text", lines=12, placeholder="Paste any text…")
             btn_use_text = gr.Button("Use this text", variant="primary")
 
         with gr.Tab("Chunking"):
@@ -241,16 +312,32 @@ Next: embeddings → FAISS → retrieval.
             with gr.Row():
                 chunk_size = gr.Slider(600, 2400, value=1200, step=50, label="Chunk size (chars)")
                 chunk_overlap = gr.Slider(0, 600, value=200, step=25, label="Chunk overlap (chars)")
-                min_chunk_chars = gr.Slider(50, 600, value=200, step=25, label="Min chunk chars (skip tiny chunks)")
+                min_chunk_chars = gr.Slider(50, 600, value=200, step=25, label="Min chunk chars")
             btn_chunk = gr.Button("Create chunks", variant="primary")
 
-    with gr.Row():
-        stats_records = gr.Textbox(label="Ingestion status / stats", lines=10)
-        stats_chunks = gr.Textbox(label="Chunking status / stats", lines=10)
+        with gr.Tab("Index & Retrieve"):
+            gr.Markdown("### Build FAISS index (embeddings)")
+            model_name = gr.Dropdown(
+                EMBEDDING_MODELS,
+                value=EMBEDDING_MODELS[0],
+                label="Embedding model",
+            )
+            btn_index = gr.Button("Build FAISS index", variant="primary")
+            index_status = gr.Textbox(label="Index status", lines=6)
+
+            gr.Markdown("### Retrieval (sanity check before LLM)")
+            query = gr.Textbox(label="Query", lines=2, placeholder="Ask something about your PDFs…")
+            top_k = gr.Slider(1, 10, value=5, step=1, label="Top-k")
+            btn_retrieve = gr.Button("Retrieve top-k chunks", variant="secondary")
+            retrieval_out = gr.Markdown("No results.")
 
     with gr.Row():
-        preview_records = gr.Textbox(label="Extracted preview (first pages)", lines=18)
-        preview_chunks = gr.Textbox(label="Chunk preview (first chunks)", lines=18)
+        stats_records = gr.Textbox(label="Ingestion stats", lines=10)
+        stats_chunks = gr.Textbox(label="Chunking stats", lines=10)
+
+    with gr.Row():
+        preview_records = gr.Textbox(label="Extracted preview", lines=18)
+        preview_chunks = gr.Textbox(label="Chunk preview", lines=18)
 
     btn_extract.click(
         fn=load_pdfs,
@@ -270,10 +357,22 @@ Next: embeddings → FAISS → retrieval.
         outputs=[chunks_state, stats_chunks, preview_chunks],
     )
 
+    btn_index.click(
+        fn=build_index,
+        inputs=[chunks_state, model_name],
+        outputs=[store_state, index_status],
+    )
+
+    btn_retrieve.click(
+        fn=run_retrieval,
+        inputs=[store_state, query, top_k],
+        outputs=[retrieval_out],
+    )
+
     btn_clear.click(
         fn=clear_session,
         inputs=[],
-        outputs=[records_state, chunks_state, stats_records, preview_records, preview_chunks],
+        outputs=[records_state, chunks_state, store_state, stats_records, preview_records, preview_chunks, index_status, retrieval_out],
     )
 
 if __name__ == "__main__":
