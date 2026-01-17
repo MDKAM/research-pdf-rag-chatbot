@@ -129,9 +129,11 @@ def _retrieval_to_markdown(results: List[RetrievedChunk]) -> str:
     lines = ["### Top retrieved chunks (for citations later)\n"]
     for r in results:
         snippet = (r.text[:350] + "…") if len(r.text) > 350 else r.text
+        snippet_one_line = snippet.replace("\n", " ").replace("\r", " ")
+
         lines.append(
             f"**{r.rank}.** score={r.score:.4f} | `{r.chunk_id}` | **{r.doc_name}** p{r.page_start}-{r.page_end}\n\n"
-            f"> {snippet.replace('\n', ' ')}\n"
+            f"> {snippet_one_line}\n"
         )
     return "\n".join(lines).strip()
 
