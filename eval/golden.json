@@ -1,0 +1,48 @@
+{
+  "name": "starter_golden_set",
+  "description": "Golden questions for evaluating a PDF RAG chatbot on this thesis proposal. expected_pages are 1-indexed and optional.",
+  "items": [
+    {
+      "id": "q1",
+      "question": "What problem is this thesis proposal trying to solve, and why is it important in healthcare or indoor environments?",
+      "expected_keywords": ["surface contamination", "organic residues", "saliva", "infection transmission", "healthcare-associated infections", "disinfection robots"],
+      "expected_pages": [1, 5]
+    },
+    {
+      "id": "q2",
+      "question": "What is the core idea of the proposed solution (UV-C fluorescence imaging), and what fluorescence/physics concepts does it rely on?",
+      "expected_keywords": ["fluorescence", "excitation", "emission", "UV-C", "UVA", "quantum yield", "Beer-Lambert", "tryptophan"],
+      "expected_pages": [2, 4]
+    },
+    {
+      "id": "q3",
+      "question": "What specific wavelengths are used (or targeted) for saliva excitation and emission, and what filter band is used on the camera?",
+      "expected_keywords": ["282 nm", "265 nm", "350 nm", "345", "355", "320", "380", "band-pass filter", "Baader U-Filter"],
+      "expected_pages": [3, 10]
+    },
+    {
+      "id": "q4",
+      "question": "Describe the imaging hardware and setup: camera model/modification, lens choice, UV-C panel specs, and geometry (FoV, distances, positioning).",
+      "expected_keywords": ["Sony NEX-6", "hot mirror removal", "full-spectrum", "Kuribayashi", "35mm", "UV-C LED panel", "20 LEDs", "radiation angle", "FoV", "30 cm", "1650 mW"],
+      "expected_pages": [9, 11]
+    },
+    {
+      "id": "q5",
+      "question": "How will data be collected and what detection/segmentation approach is planned (including what varies across trials and what metrics are used)?",
+      "expected_keywords": ["dataset", "surface types", "steel", "plastic", "wood", "wet", "dried", "pixel-wise classification", "statistical models", "segmentation map", "accuracy", "precision", "recall"],
+      "expected_pages": [10, 11]
+    },
+    {
+      "id": "q6",
+      "question": "What safety constraints and protocols are described for working with UV-C and saliva, and what key numerical safety limits are reported?",
+      "expected_keywords": ["TLV", "3 mJ/cm2", "8 hour", "irradiance", "11.73 W/m2", "20 cm", "2.5 seconds", "biosafety", "PPE", "windowless room", "door sensor", "automatic shutdown"],
+      "expected_pages": [12, 13]
+    },
+    {
+      "id": "q7",
+      "question": "In the literature review, what are the main alternative approaches to contamination assessment/detection, and what limitations motivate this proposed method?",
+      "expected_keywords": ["visual inspection", "fluorescent markers", "ATP bioluminescence", "bacteriological cultures", "limitations", "time-consuming", "costly", "subjective", "real-time", "robotics"],
+      "expected_pages": [1, 8]
+    }
+  ]
+}

@@ -38,6 +38,16 @@ from ragpdf.llm_api import (
     LLMError,
 )
 
+from ragpdf.eval import (
+    load_golden,
+    keyword_coverage,
+    has_citation,
+    pages_hit_expected,
+    summarize_rows,
+    format_report,
+    EvalRow,
+)
+
 # ----------------------------
 # Guardrails (cost & stability)
 # ----------------------------
@@ -50,8 +60,8 @@ MAX_CHUNKS = 1200
 MAX_QUERY_CHARS = 2000
 
 # Context and answer limits (cost control)
-MAX_CONTEXT_CHARS = 12_000     # concatenated retrieved sources text
-MAX_SOURCE_CHARS_EACH = 2_000  # per chunk text cap in prompt
+MAX_CONTEXT_CHARS = 12_000
+MAX_SOURCE_CHARS_EACH = 2_000
 DEFAULT_TOP_K = 5
 
 DEFAULT_MAX_OUTPUT_TOKENS = 450
@@ -59,6 +69,9 @@ DEFAULT_TEMPERATURE = 0.2
 
 # Rate limit: per session
 MAX_CALLS_PER_MIN = 6
+
+# Eval guardrails
+MAX_EVAL_QUESTIONS = 10
 
 # Embedding model defaults (HF)
 EMBEDDING_MODELS = [
@@ -147,7 +160,6 @@ def _chunks_to_preview(chunks: List[ChunkRecord], max_chars: int = 5000) -> str:
 def _retrieval_to_markdown(results: List[RetrievedChunk]) -> str:
     if not results:
         return "No results."
-
     lines = ["### Top retrieved chunks\n"]
     for r in results:
         snippet = (r.text[:350] + "…") if len(r.text) > 350 else r.text
@@ -200,7 +212,6 @@ def load_pasted_text(text: str):
     text = (text or "").strip()
     if not text:
         return [], "❌ Please paste some text.", "No preview available."
-
     if len(text) > MAX_PASTE_CHARS:
         text = text[:MAX_PASTE_CHARS]
 
@@ -215,15 +226,9 @@ def load_pasted_text(text: str):
     return stored, stats, preview
 
 
-def run_chunking(
-    records: List[Dict[str, Any]],
-    chunk_size: int,
-    chunk_overlap: int,
-    min_chunk_chars: int,
-):
+def run_chunking(records: List[Dict[str, Any]], chunk_size: int, chunk_overlap: int, min_chunk_chars: int):
     if not records:
         return [], "❌ No extracted records. Upload PDFs or paste text first.", "No preview available."
-
     try:
         t0 = time.time()
         chunks = chunk_pages(
@@ -238,7 +243,6 @@ def run_chunking(
         stats = _chunks_to_stats(chunks, elapsed)
         preview = _chunks_to_preview(chunks)
         return stored, stats, preview
-
     except ChunkingError as e:
         return [], f"❌ Chunking error: {e}", "No preview available."
     except Exception as e:
@@ -248,15 +252,9 @@ def run_chunking(
 def build_index(chunks: List[Dict[str, Any]], model_name: str):
     if not chunks:
         return None, "❌ No chunks found. Run chunking first."
-
     try:
         t0 = time.time()
-        store = build_faiss_index(
-            chunks=chunks,
-            model_name=model_name,
-            batch_size=32,
-            max_chunks=MAX_CHUNKS,
-        )
+        store = build_faiss_index(chunks=chunks, model_name=model_name, batch_size=32, max_chunks=MAX_CHUNKS)
         elapsed = time.time() - t0
         msg = (
             "✅ FAISS index built.\n"
@@ -264,39 +262,15 @@ def build_index(chunks: List[Dict[str, Any]], model_name: str):
             f"- Dim: {store['dim']}\n"
             f"- Vectors: {store['index'].ntotal}\n"
             f"- Time: {elapsed:.2f}s\n"
-            f"- Similarity: cosine (via inner product on L2-normalized vectors)\n"
+            f"- Similarity: cosine (inner product on normalized vectors)\n"
         )
         return store, msg
-    except VectorStoreError as e:
+    except Exception as e:
         return None, f"❌ Index build error: {e}"
-    except Exception as e:
-        return None, f"❌ Unexpected error: {e}"
-
-
-def run_retrieval(store: Dict[str, Any] | None, query: str, top_k: int):
-    query = (query or "").strip()
-    if len(query) > MAX_QUERY_CHARS:
-        query = query[:MAX_QUERY_CHARS]
-
-    if not query:
-        return "❌ Please enter a query."
-
-    try:
-        t0 = time.time()
-        results = retrieve(store=store or {}, query=query, top_k=int(top_k))
-        elapsed = time.time() - t0
-        md = _retrieval_to_markdown(results)
-        md += f"\n\n_⏱ retrieval time: {elapsed:.2f}s | top_k={int(top_k)}_"
-        return md
-    except VectorStoreError as e:
-        return f"❌ Retrieval error: {e}"
-    except Exception as e:
-        return f"❌ Unexpected error: {e}"
 
 
 def _rate_limit_ok(rate_state: List[float]) -> Tuple[bool, List[float], str]:
     now = time.time()
-    # Keep last 60s
     rate_state = [t for t in (rate_state or []) if now - t < 60.0]
     if len(rate_state) >= MAX_CALLS_PER_MIN:
         wait_s = int(60 - (now - min(rate_state)))
@@ -306,17 +280,12 @@ def _rate_limit_ok(rate_state: List[float]) -> Tuple[bool, List[float], str]:
 
 
 def _build_rag_prompts(question: str, results: List[RetrievedChunk]) -> Tuple[str, str, str]:
-    """
-    Returns (system_prompt, user_prompt, sources_md)
-    """
     system_prompt = (
         "You are a research assistant. Answer using ONLY the provided sources. "
         "If the answer is not in the sources, say you don't know. "
-        "When you use a source, cite it inline using square brackets with the chunk id, e.g. [mydoc:p2-p3:c0001]. "
-        "Be concise and accurate."
+        "Cite sources inline using square brackets with the chunk id, e.g. [mydoc:p2-p3:c0001]."
     )
 
-    # Build sources block with truncation controls
     blocks = []
     used = 0
     for r in results:
@@ -340,10 +309,8 @@ def _build_rag_prompts(question: str, results: List[RetrievedChunk]) -> Tuple[st
         "Instructions:\n"
         "- Provide a direct answer.\n"
         "- Include citations like [chunk_id] immediately after the relevant claims.\n"
-        "- If sources disagree, mention uncertainty and cite both.\n"
     )
 
-    # Also prepare a clean Sources list for UI
     sources_lines = ["### Sources used"]
     for r in results:
         sources_lines.append(f"- `{r.chunk_id}` — **{r.doc_name}** p{r.page_start}-{r.page_end}")
@@ -366,7 +333,6 @@ def rag_answer(
     question = (question or "").strip()
     if len(question) > MAX_QUERY_CHARS:
         question = question[:MAX_QUERY_CHARS]
-
     if not question:
         return "❌ Please enter a question.", "No retrieval yet.", rate_state
 
@@ -375,37 +341,34 @@ def rag_answer(
         return msg, "No retrieval yet.", rate_state
 
     if not store:
-        return "❌ Build the FAISS index first (Ticket 3).", "No retrieval yet.", rate_state
+        return "❌ Build the FAISS index first.", "No retrieval yet.", rate_state
 
     try:
-        # 1) Retrieve
+        # Retrieve
         t0 = time.time()
         results = retrieve(store=store, query=question, top_k=int(top_k))
         retr_latency = time.time() - t0
         retrieval_md = _retrieval_to_markdown(results) + f"\n\n_⏱ retrieval time: {retr_latency:.2f}s_"
-
         if not results:
-            return "I couldn't retrieve any relevant sources for that question.", retrieval_md, rate_state
+            return "I couldn't retrieve relevant sources for that question.", retrieval_md, rate_state
 
-        # 2) Build prompts
+        # Prompts
         system_prompt, user_prompt, sources_md = _build_rag_prompts(question, results)
 
-        # 3) Choose provider/model
+        # Provider/model selection
         provider = (provider or "auto").strip().lower()
         if provider == "groq":
             model = (groq_model or GROQ_DEFAULT_MODEL).strip()
         elif provider == "gemini":
             model = (gemini_model or GEMINI_DEFAULT_MODEL).strip()
         else:
-            # auto
             if env_has_groq():
                 provider, model = "groq", (groq_model or GROQ_DEFAULT_MODEL).strip()
             elif env_has_gemini():
                 provider, model = "gemini", (gemini_model or GEMINI_DEFAULT_MODEL).strip()
             else:
-                return "❌ No API key found. Set GROQ_API_KEY or GEMINI_API_KEY in Space secrets.", retrieval_md, rate_state
+                return "❌ No API key found. Set GROQ_API_KEY or GEMINI_API_KEY.", retrieval_md, rate_state
 
-        # 4) Call LLM
         resp = call_llm(
             provider=provider,
             model=model,
@@ -417,26 +380,124 @@ def rag_answer(
             retries=2,
         )
 
-        # 5) Ensure we show sources even if the model forgets citations
         answer = resp.text.strip()
         footer = (
             f"\n\n---\n"
-            f"_LLM: {resp.provider} / {resp.model} | ⏱ {resp.latency_s:.2f}s | top_k={int(top_k)} | "
-            f"max_output_tokens={int(max_output_tokens)}_\n\n"
+            f"_LLM: {resp.provider} / {resp.model} | ⏱ {resp.latency_s:.2f}s | top_k={int(top_k)} | max_output_tokens={int(max_output_tokens)}_\n\n"
             f"{sources_md}"
         )
         return answer + footer, retrieval_md, rate_state
 
-    except VectorStoreError as e:
-        return f"❌ Retrieval error: {e}", "No retrieval yet.", rate_state
-    except LLMError as e:
-        return f"❌ LLM error: {e}", "Retrieval may have succeeded above.", rate_state
     except Exception as e:
-        return f"❌ Unexpected error: {e}", "No retrieval yet.", rate_state
+        return f"❌ Error: {e}", "Retrieval may have succeeded above.", rate_state
+
+
+# ----------------------------
+# Evaluation runner
+# ----------------------------
+def run_eval(
+    store: Dict[str, Any] | None,
+    provider: str,
+    groq_model: str,
+    gemini_model: str,
+    top_k: int,
+    temperature: float,
+    max_output_tokens: int,
+    golden_path: str,
+    rate_state: List[float],
+):
+    if not store:
+        return "❌ Build the FAISS index first.", rate_state
+
+    golden_path = (golden_path or "").strip()
+    if not golden_path:
+        golden_path = "eval/golden.json"
+
+    if not os.path.exists(golden_path):
+        return f"❌ Golden set not found at: {golden_path}", rate_state
+
+    items = load_golden(golden_path)[:MAX_EVAL_QUESTIONS]
+    if not items:
+        return "❌ No eval items found in golden set.", rate_state
+
+    rows: List[EvalRow] = []
+    for it in items:
+        # Rate limit (counts as an LLM call)
+        ok, rate_state, msg = _rate_limit_ok(rate_state)
+        if not ok:
+            return f"{msg}\n\nStopped early after {len(rows)} questions.", rate_state
+
+        # Retrieval
+        t0 = time.time()
+        results = retrieve(store=store, query=it.question, top_k=int(top_k))
+        retr_latency = time.time() - t0
+
+        # Prompts + call LLM
+        system_prompt, user_prompt, _sources_md = _build_rag_prompts(it.question, results)
+
+        provider2 = (provider or "auto").strip().lower()
+        if provider2 == "groq":
+            model = (groq_model or GROQ_DEFAULT_MODEL).strip()
+        elif provider2 == "gemini":
+            model = (gemini_model or GEMINI_DEFAULT_MODEL).strip()
+        else:
+            if env_has_groq():
+                provider2, model = "groq", (groq_model or GROQ_DEFAULT_MODEL).strip()
+            elif env_has_gemini():
+                provider2, model = "gemini", (gemini_model or GEMINI_DEFAULT_MODEL).strip()
+            else:
+                return "❌ No API key found.", rate_state
+
+        llm_t0 = time.time()
+        resp = call_llm(
+            provider=provider2,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=float(temperature),
+            max_output_tokens=int(max_output_tokens),
+            timeout_s=60,
+            retries=2,
+        )
+        llm_latency = time.time() - llm_t0
+        total = retr_latency + llm_latency
+
+        # Metrics
+        ans = resp.text or ""
+        kw = keyword_coverage(ans, it.expected_keywords)
+        cite = has_citation(ans)
+
+        retrieved_chunk_ids = [r.chunk_id for r in results]
+        retrieved_pages = [(r.doc_name, r.page_start, r.page_end) for r in results]
+        hit_pages = pages_hit_expected(retrieved_pages, it.expected_pages)
+
+        preview = ans.strip().replace("\n", " ")
+        preview = preview[:160] + ("…" if len(preview) > 160 else "")
+
+        rows.append(
+            EvalRow(
+                id=it.id,
+                question=it.question,
+                top_k=int(top_k),
+                retrieved_chunk_ids=retrieved_chunk_ids,
+                retrieved_pages=retrieved_pages,
+                retrieval_hits_expected_pages=hit_pages,
+                keyword_coverage=kw,
+                has_citation=cite,
+                retrieval_latency_s=retr_latency,
+                llm_latency_s=llm_latency,
+                total_latency_s=total,
+                answer_preview=preview,
+            )
+        )
+
+    summary = summarize_rows(rows)
+    report = format_report(summary, rows)
+    return report, rate_state
 
 
 def clear_session():
-    return [], [], None, [], "Cleared.", "No extracted text to preview yet.", "No chunks to preview yet.", "Index cleared.", "No results.", "No answer yet."
+    return [], [], None, [], "Cleared.", "No extracted text to preview yet.", "No chunks to preview yet.", "Index cleared.", "No results.", "No answer yet.", "No eval run yet."
 
 
 def api_key_status() -> str:
@@ -450,84 +511,64 @@ def api_key_status() -> str:
     )
 
 
-with gr.Blocks(title="Research PDF RAG Chatbot (Ticket 4)") as demo:
+with gr.Blocks(title="Research PDF RAG Chatbot (Ticket 5)") as demo:
     gr.Markdown(
         """
 # Research PDF RAG Chatbot
-✅ Ticket 1: PDF/text ingestion with page numbers  
-✅ Ticket 2: Chunking with stable chunk IDs + page ranges  
-✅ Ticket 3: Embeddings + FAISS + retrieval UI  
-✅ Ticket 4: LLM answering (Groq/Gemini) + citations  
-
-Next: Ticket 5 = evaluation + “golden questions” test set.
 """
     )
 
-    records_state = gr.State([])   # page records
-    chunks_state = gr.State([])    # chunk records
-    store_state = gr.State(None)   # FAISS store
-    rate_state = gr.State([])      # timestamps for rate limiting
+    records_state = gr.State([])
+    chunks_state = gr.State([])
+    store_state = gr.State(None)
+    rate_state = gr.State([])
 
     with gr.Tabs():
         with gr.Tab("Upload PDF(s)"):
-            pdfs = gr.File(
-                label="Upload one or more PDFs",
-                file_types=[".pdf"],
-                file_count="multiple",
-                type="filepath",
-            )
+            pdfs = gr.File(label="Upload PDFs", file_types=[".pdf"], file_count="multiple", type="filepath")
             with gr.Row():
-                btn_extract = gr.Button("Extract text from PDFs", variant="primary")
+                btn_extract = gr.Button("Extract text", variant="primary")
                 btn_clear = gr.Button("Clear session")
 
         with gr.Tab("Paste text"):
-            pasted = gr.Textbox(label="Paste text", lines=12, placeholder="Paste any text…")
+            pasted = gr.Textbox(label="Paste text", lines=12)
             btn_use_text = gr.Button("Use this text", variant="primary")
 
         with gr.Tab("Chunking"):
-            gr.Markdown("### Chunk settings")
             with gr.Row():
-                chunk_size = gr.Slider(600, 2400, value=1200, step=50, label="Chunk size (chars)")
-                chunk_overlap = gr.Slider(0, 600, value=200, step=25, label="Chunk overlap (chars)")
+                chunk_size = gr.Slider(600, 2400, value=1200, step=50, label="Chunk size")
+                chunk_overlap = gr.Slider(0, 600, value=200, step=25, label="Chunk overlap")
                 min_chunk_chars = gr.Slider(50, 600, value=200, step=25, label="Min chunk chars")
             btn_chunk = gr.Button("Create chunks", variant="primary")
 
-        with gr.Tab("Index & Retrieve"):
-            gr.Markdown("### Build FAISS index (embeddings)")
+        with gr.Tab("Index"):
             model_name = gr.Dropdown(EMBEDDING_MODELS, value=EMBEDDING_MODELS[0], label="Embedding model")
             btn_index = gr.Button("Build FAISS index", variant="primary")
             index_status = gr.Textbox(label="Index status", lines=6)
 
-            gr.Markdown("### Retrieval (sanity check)")
-            query = gr.Textbox(label="Query", lines=2, placeholder="Ask something about your PDFs…")
-            top_k_retr = gr.Slider(1, 10, value=DEFAULT_TOP_K, step=1, label="Top-k")
-            btn_retrieve = gr.Button("Retrieve top-k chunks", variant="secondary")
-            retrieval_out = gr.Markdown("No results.")
-
-        with gr.Tab("Ask (RAG Answer)"):
+        with gr.Tab("Ask"):
             gr.Markdown(api_key_status())
-
-            with gr.Row():
-                provider = gr.Dropdown(
-                    ["auto", "groq", "gemini"],
-                    value="auto",
-                    label="LLM provider",
-                )
-
+            provider = gr.Dropdown(["auto", "groq", "gemini"], value="auto", label="LLM provider")
             with gr.Row():
                 groq_model = gr.Textbox(label="Groq model", value=GROQ_DEFAULT_MODEL)
                 gemini_model = gr.Textbox(label="Gemini model", value=GEMINI_DEFAULT_MODEL)
-
             with gr.Row():
                 top_k = gr.Slider(1, 10, value=DEFAULT_TOP_K, step=1, label="Top-k sources")
                 temperature = gr.Slider(0.0, 1.0, value=DEFAULT_TEMPERATURE, step=0.05, label="Temperature")
                 max_output_tokens = gr.Slider(128, 1024, value=DEFAULT_MAX_OUTPUT_TOKENS, step=32, label="Max output tokens")
-
-            question = gr.Textbox(label="Question", lines=2, placeholder="Ask a question about the uploaded PDFs…")
-            btn_answer = gr.Button("Answer with RAG + citations", variant="primary")
-
+            question = gr.Textbox(label="Question", lines=2)
+            btn_answer = gr.Button("Answer (RAG)", variant="primary")
             answer_out = gr.Markdown("No answer yet.")
-            retrieval_out2 = gr.Markdown("No retrieval yet.")
+            retrieval_out = gr.Markdown("No retrieval yet.")
+
+        with gr.Tab("Evaluation"):
+            gr.Markdown(
+                "Runs a small golden test set through retrieval + LLM.\n\n"
+                "Edit `eval/golden.json` to match your uploaded PDFs for meaningful results."
+            )
+            golden_path = gr.Textbox(label="Golden set path", value="eval/golden.json")
+            btn_eval = gr.Button("Run evaluation", variant="primary")
+            eval_out = gr.Markdown("No eval run yet.")
 
     with gr.Row():
         stats_records = gr.Textbox(label="Ingestion stats", lines=10)
@@ -537,41 +578,22 @@ Next: Ticket 5 = evaluation + “golden questions” test set.
         preview_records = gr.Textbox(label="Extracted preview", lines=18)
         preview_chunks = gr.Textbox(label="Chunk preview", lines=18)
 
-    # Wiring
-    btn_extract.click(
-        fn=load_pdfs,
-        inputs=[pdfs, records_state],
-        outputs=[records_state, stats_records, preview_records],
-    )
-
-    btn_use_text.click(
-        fn=load_pasted_text,
-        inputs=[pasted],
-        outputs=[records_state, stats_records, preview_records],
-    )
-
-    btn_chunk.click(
-        fn=run_chunking,
-        inputs=[records_state, chunk_size, chunk_overlap, min_chunk_chars],
-        outputs=[chunks_state, stats_chunks, preview_chunks],
-    )
-
-    btn_index.click(
-        fn=build_index,
-        inputs=[chunks_state, model_name],
-        outputs=[store_state, index_status],
-    )
-
-    btn_retrieve.click(
-        fn=run_retrieval,
-        inputs=[store_state, query, top_k_retr],
-        outputs=[retrieval_out],
-    )
+    # Wire up actions
+    btn_extract.click(fn=load_pdfs, inputs=[pdfs, records_state], outputs=[records_state, stats_records, preview_records])
+    btn_use_text.click(fn=load_pasted_text, inputs=[pasted], outputs=[records_state, stats_records, preview_records])
+    btn_chunk.click(fn=run_chunking, inputs=[records_state, chunk_size, chunk_overlap, min_chunk_chars], outputs=[chunks_state, stats_chunks, preview_chunks])
+    btn_index.click(fn=build_index, inputs=[chunks_state, model_name], outputs=[store_state, index_status])
 
     btn_answer.click(
         fn=rag_answer,
         inputs=[store_state, question, provider, groq_model, gemini_model, top_k, temperature, max_output_tokens, rate_state],
-        outputs=[answer_out, retrieval_out2, rate_state],
+        outputs=[answer_out, retrieval_out, rate_state],
+    )
+
+    btn_eval.click(
+        fn=run_eval,
+        inputs=[store_state, provider, groq_model, gemini_model, top_k, temperature, max_output_tokens, golden_path, rate_state],
+        outputs=[eval_out, rate_state],
     )
 
     btn_clear.click(
@@ -580,7 +602,7 @@ Next: Ticket 5 = evaluation + “golden questions” test set.
         outputs=[
             records_state, chunks_state, store_state, rate_state,
             stats_records, preview_records, preview_chunks,
-            index_status, retrieval_out, answer_out
+            index_status, retrieval_out, answer_out, eval_out
         ],
     )
 
