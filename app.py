@@ -435,18 +435,12 @@ def run_eval(
         # Prompts + call LLM
         system_prompt, user_prompt, _sources_md = _build_rag_prompts(it.question, results)
 
-        provider2 = (provider or "auto").strip().lower()
-        if provider2 == "groq":
-            model = (groq_model or GROQ_DEFAULT_MODEL).strip()
-        elif provider2 == "gemini":
-            model = (gemini_model or GEMINI_DEFAULT_MODEL).strip()
-        else:
-            if env_has_groq():
-                provider2, model = "groq", (groq_model or GROQ_DEFAULT_MODEL).strip()
-            elif env_has_gemini():
-                provider2, model = "gemini", (gemini_model or GEMINI_DEFAULT_MODEL).strip()
-            else:
-                return "❌ No API key found.", rate_state
+        # Force evaluation to use Gemini only (avoids Groq free-tier limits)
+        if not env_has_gemini():
+            return "❌ Evaluation is set to Gemini-only, but GEMINI_API_KEY is missing.", rate_state
+
+        provider2 = "gemini"
+        model = (gemini_model or GEMINI_DEFAULT_MODEL).strip()
 
         llm_t0 = time.time()
         resp = call_llm(
@@ -461,6 +455,9 @@ def run_eval(
         )
         llm_latency = time.time() - llm_t0
         total = retr_latency + llm_latency
+
+        # if it != items[-1]:
+        #     time.sleep(1.2)  # small delay between calls
 
         # Metrics
         ans = resp.text or ""
@@ -564,6 +561,7 @@ with gr.Blocks(title="Research PDF RAG Chatbot (Ticket 5)") as demo:
         with gr.Tab("Evaluation"):
             gr.Markdown(
                 "Runs a small golden test set through retrieval + LLM.\n\n"
+                "**Evaluation uses Gemini-only** to avoid Groq free-tier rate limits.\n\n"
                 "Edit `eval/golden.json` to match your uploaded PDFs for meaningful results."
             )
             golden_path = gr.Textbox(label="Golden set path", value="eval/golden.json")
