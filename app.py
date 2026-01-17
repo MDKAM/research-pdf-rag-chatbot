@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import time
 import uuid
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 import gradio as gr
 
@@ -31,6 +31,13 @@ from ragpdf.vectorstore import (
     RetrievedChunk,
 )
 
+from ragpdf.llm_api import (
+    call_llm,
+    env_has_groq,
+    env_has_gemini,
+    LLMError,
+)
+
 # ----------------------------
 # Guardrails (cost & stability)
 # ----------------------------
@@ -42,11 +49,26 @@ MAX_PASTE_CHARS = 200_000
 MAX_CHUNKS = 1200
 MAX_QUERY_CHARS = 2000
 
+# Context and answer limits (cost control)
+MAX_CONTEXT_CHARS = 12_000     # concatenated retrieved sources text
+MAX_SOURCE_CHARS_EACH = 2_000  # per chunk text cap in prompt
+DEFAULT_TOP_K = 5
+
+DEFAULT_MAX_OUTPUT_TOKENS = 450
+DEFAULT_TEMPERATURE = 0.2
+
+# Rate limit: per session
+MAX_CALLS_PER_MIN = 6
+
 # Embedding model defaults (HF)
 EMBEDDING_MODELS = [
     "sentence-transformers/all-MiniLM-L6-v2",
     "intfloat/e5-small-v2",
 ]
+
+# LLM defaults
+GROQ_DEFAULT_MODEL = "llama-3.1-8b-instant"
+GEMINI_DEFAULT_MODEL = "gemini-2.0-flash"
 
 
 def _records_to_preview(records: List[PageRecord], max_chars: int = 4000) -> str:
@@ -126,11 +148,10 @@ def _retrieval_to_markdown(results: List[RetrievedChunk]) -> str:
     if not results:
         return "No results."
 
-    lines = ["### Top retrieved chunks (for citations later)\n"]
+    lines = ["### Top retrieved chunks\n"]
     for r in results:
         snippet = (r.text[:350] + "…") if len(r.text) > 350 else r.text
         snippet_one_line = snippet.replace("\n", " ").replace("\r", " ")
-
         lines.append(
             f"**{r.rank}.** score={r.score:.4f} | `{r.chunk_id}` | **{r.doc_name}** p{r.page_start}-{r.page_end}\n\n"
             f"> {snippet_one_line}\n"
@@ -273,25 +294,179 @@ def run_retrieval(store: Dict[str, Any] | None, query: str, top_k: int):
         return f"❌ Unexpected error: {e}"
 
 
+def _rate_limit_ok(rate_state: List[float]) -> Tuple[bool, List[float], str]:
+    now = time.time()
+    # Keep last 60s
+    rate_state = [t for t in (rate_state or []) if now - t < 60.0]
+    if len(rate_state) >= MAX_CALLS_PER_MIN:
+        wait_s = int(60 - (now - min(rate_state)))
+        return False, rate_state, f"⛔ Rate limit: {MAX_CALLS_PER_MIN}/min. Try again in ~{wait_s}s."
+    rate_state.append(now)
+    return True, rate_state, ""
+
+
+def _build_rag_prompts(question: str, results: List[RetrievedChunk]) -> Tuple[str, str, str]:
+    """
+    Returns (system_prompt, user_prompt, sources_md)
+    """
+    system_prompt = (
+        "You are a research assistant. Answer using ONLY the provided sources. "
+        "If the answer is not in the sources, say you don't know. "
+        "When you use a source, cite it inline using square brackets with the chunk id, e.g. [mydoc:p2-p3:c0001]. "
+        "Be concise and accurate."
+    )
+
+    # Build sources block with truncation controls
+    blocks = []
+    used = 0
+    for r in results:
+        text = r.text[:MAX_SOURCE_CHARS_EACH]
+        block = (
+            f"SOURCE: {r.chunk_id}\n"
+            f"DOCUMENT: {r.doc_name}\n"
+            f"PAGES: {r.page_start}-{r.page_end}\n"
+            f"TEXT:\n{text}\n"
+        )
+        if used + len(block) > MAX_CONTEXT_CHARS:
+            break
+        blocks.append(block)
+        used += len(block)
+
+    sources_block = "\n\n".join(blocks).strip()
+
+    user_prompt = (
+        f"Sources:\n{sources_block}\n\n"
+        f"Question: {question}\n\n"
+        "Instructions:\n"
+        "- Provide a direct answer.\n"
+        "- Include citations like [chunk_id] immediately after the relevant claims.\n"
+        "- If sources disagree, mention uncertainty and cite both.\n"
+    )
+
+    # Also prepare a clean Sources list for UI
+    sources_lines = ["### Sources used"]
+    for r in results:
+        sources_lines.append(f"- `{r.chunk_id}` — **{r.doc_name}** p{r.page_start}-{r.page_end}")
+    sources_md = "\n".join(sources_lines)
+
+    return system_prompt, user_prompt, sources_md
+
+
+def rag_answer(
+    store: Dict[str, Any] | None,
+    question: str,
+    provider: str,
+    groq_model: str,
+    gemini_model: str,
+    top_k: int,
+    temperature: float,
+    max_output_tokens: int,
+    rate_state: List[float],
+):
+    question = (question or "").strip()
+    if len(question) > MAX_QUERY_CHARS:
+        question = question[:MAX_QUERY_CHARS]
+
+    if not question:
+        return "❌ Please enter a question.", "No retrieval yet.", rate_state
+
+    ok, rate_state, msg = _rate_limit_ok(rate_state)
+    if not ok:
+        return msg, "No retrieval yet.", rate_state
+
+    if not store:
+        return "❌ Build the FAISS index first (Ticket 3).", "No retrieval yet.", rate_state
+
+    try:
+        # 1) Retrieve
+        t0 = time.time()
+        results = retrieve(store=store, query=question, top_k=int(top_k))
+        retr_latency = time.time() - t0
+        retrieval_md = _retrieval_to_markdown(results) + f"\n\n_⏱ retrieval time: {retr_latency:.2f}s_"
+
+        if not results:
+            return "I couldn't retrieve any relevant sources for that question.", retrieval_md, rate_state
+
+        # 2) Build prompts
+        system_prompt, user_prompt, sources_md = _build_rag_prompts(question, results)
+
+        # 3) Choose provider/model
+        provider = (provider or "auto").strip().lower()
+        if provider == "groq":
+            model = (groq_model or GROQ_DEFAULT_MODEL).strip()
+        elif provider == "gemini":
+            model = (gemini_model or GEMINI_DEFAULT_MODEL).strip()
+        else:
+            # auto
+            if env_has_groq():
+                provider, model = "groq", (groq_model or GROQ_DEFAULT_MODEL).strip()
+            elif env_has_gemini():
+                provider, model = "gemini", (gemini_model or GEMINI_DEFAULT_MODEL).strip()
+            else:
+                return "❌ No API key found. Set GROQ_API_KEY or GEMINI_API_KEY in Space secrets.", retrieval_md, rate_state
+
+        # 4) Call LLM
+        resp = call_llm(
+            provider=provider,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=float(temperature),
+            max_output_tokens=int(max_output_tokens),
+            timeout_s=60,
+            retries=2,
+        )
+
+        # 5) Ensure we show sources even if the model forgets citations
+        answer = resp.text.strip()
+        footer = (
+            f"\n\n---\n"
+            f"_LLM: {resp.provider} / {resp.model} | ⏱ {resp.latency_s:.2f}s | top_k={int(top_k)} | "
+            f"max_output_tokens={int(max_output_tokens)}_\n\n"
+            f"{sources_md}"
+        )
+        return answer + footer, retrieval_md, rate_state
+
+    except VectorStoreError as e:
+        return f"❌ Retrieval error: {e}", "No retrieval yet.", rate_state
+    except LLMError as e:
+        return f"❌ LLM error: {e}", "Retrieval may have succeeded above.", rate_state
+    except Exception as e:
+        return f"❌ Unexpected error: {e}", "No retrieval yet.", rate_state
+
+
 def clear_session():
-    return [], [], None, "Cleared.", "No extracted text to preview yet.", "No chunks to preview yet.", "Index cleared.", "No results."
+    return [], [], None, [], "Cleared.", "No extracted text to preview yet.", "No chunks to preview yet.", "Index cleared.", "No results.", "No answer yet."
 
 
-with gr.Blocks(title="Research PDF RAG Chatbot (Ticket 3)") as demo:
+def api_key_status() -> str:
+    g = "✅" if env_has_groq() else "❌"
+    m = "✅" if env_has_gemini() else "❌"
+    return (
+        "### API key status (Space secrets)\n"
+        f"- GROQ_API_KEY: {g}\n"
+        f"- GEMINI_API_KEY: {m}\n"
+        "\nSet these in **Space → Settings → Secrets**."
+    )
+
+
+with gr.Blocks(title="Research PDF RAG Chatbot (Ticket 4)") as demo:
     gr.Markdown(
         """
 # Research PDF RAG Chatbot
 ✅ Ticket 1: PDF/text ingestion with page numbers  
 ✅ Ticket 2: Chunking with stable chunk IDs + page ranges  
 ✅ Ticket 3: Embeddings + FAISS + retrieval UI  
+✅ Ticket 4: LLM answering (Groq/Gemini) + citations  
 
-Next: Ticket 4 adds LLM answering + citations.
+Next: Ticket 5 = evaluation + “golden questions” test set.
 """
     )
 
     records_state = gr.State([])   # page records
     chunks_state = gr.State([])    # chunk records
-    store_state = gr.State(None)   # FAISS store (python object)
+    store_state = gr.State(None)   # FAISS store
+    rate_state = gr.State([])      # timestamps for rate limiting
 
     with gr.Tabs():
         with gr.Tab("Upload PDF(s)"):
@@ -319,19 +494,40 @@ Next: Ticket 4 adds LLM answering + citations.
 
         with gr.Tab("Index & Retrieve"):
             gr.Markdown("### Build FAISS index (embeddings)")
-            model_name = gr.Dropdown(
-                EMBEDDING_MODELS,
-                value=EMBEDDING_MODELS[0],
-                label="Embedding model",
-            )
+            model_name = gr.Dropdown(EMBEDDING_MODELS, value=EMBEDDING_MODELS[0], label="Embedding model")
             btn_index = gr.Button("Build FAISS index", variant="primary")
             index_status = gr.Textbox(label="Index status", lines=6)
 
-            gr.Markdown("### Retrieval (sanity check before LLM)")
+            gr.Markdown("### Retrieval (sanity check)")
             query = gr.Textbox(label="Query", lines=2, placeholder="Ask something about your PDFs…")
-            top_k = gr.Slider(1, 10, value=5, step=1, label="Top-k")
+            top_k_retr = gr.Slider(1, 10, value=DEFAULT_TOP_K, step=1, label="Top-k")
             btn_retrieve = gr.Button("Retrieve top-k chunks", variant="secondary")
             retrieval_out = gr.Markdown("No results.")
+
+        with gr.Tab("Ask (RAG Answer)"):
+            gr.Markdown(api_key_status())
+
+            with gr.Row():
+                provider = gr.Dropdown(
+                    ["auto", "groq", "gemini"],
+                    value="auto",
+                    label="LLM provider",
+                )
+
+            with gr.Row():
+                groq_model = gr.Textbox(label="Groq model", value=GROQ_DEFAULT_MODEL)
+                gemini_model = gr.Textbox(label="Gemini model", value=GEMINI_DEFAULT_MODEL)
+
+            with gr.Row():
+                top_k = gr.Slider(1, 10, value=DEFAULT_TOP_K, step=1, label="Top-k sources")
+                temperature = gr.Slider(0.0, 1.0, value=DEFAULT_TEMPERATURE, step=0.05, label="Temperature")
+                max_output_tokens = gr.Slider(128, 1024, value=DEFAULT_MAX_OUTPUT_TOKENS, step=32, label="Max output tokens")
+
+            question = gr.Textbox(label="Question", lines=2, placeholder="Ask a question about the uploaded PDFs…")
+            btn_answer = gr.Button("Answer with RAG + citations", variant="primary")
+
+            answer_out = gr.Markdown("No answer yet.")
+            retrieval_out2 = gr.Markdown("No retrieval yet.")
 
     with gr.Row():
         stats_records = gr.Textbox(label="Ingestion stats", lines=10)
@@ -341,6 +537,7 @@ Next: Ticket 4 adds LLM answering + citations.
         preview_records = gr.Textbox(label="Extracted preview", lines=18)
         preview_chunks = gr.Textbox(label="Chunk preview", lines=18)
 
+    # Wiring
     btn_extract.click(
         fn=load_pdfs,
         inputs=[pdfs, records_state],
@@ -367,14 +564,24 @@ Next: Ticket 4 adds LLM answering + citations.
 
     btn_retrieve.click(
         fn=run_retrieval,
-        inputs=[store_state, query, top_k],
+        inputs=[store_state, query, top_k_retr],
         outputs=[retrieval_out],
+    )
+
+    btn_answer.click(
+        fn=rag_answer,
+        inputs=[store_state, question, provider, groq_model, gemini_model, top_k, temperature, max_output_tokens, rate_state],
+        outputs=[answer_out, retrieval_out2, rate_state],
     )
 
     btn_clear.click(
         fn=clear_session,
         inputs=[],
-        outputs=[records_state, chunks_state, store_state, stats_records, preview_records, preview_chunks, index_status, retrieval_out],
+        outputs=[
+            records_state, chunks_state, store_state, rate_state,
+            stats_records, preview_records, preview_chunks,
+            index_status, retrieval_out, answer_out
+        ],
     )
 
 if __name__ == "__main__":
