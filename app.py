@@ -329,12 +329,16 @@ def rag_answer(
     temperature: float,
     max_output_tokens: int,
     rate_state: List[float],
+    access_code: str,
 ):
     question = (question or "").strip()
     if len(question) > MAX_QUERY_CHARS:
         question = question[:MAX_QUERY_CHARS]
     if not question:
         return "❌ Please enter a question.", "No retrieval yet.", rate_state
+    
+    if not _access_ok(access_code):
+        return "⛔ Access denied. Ask for the access code to enable LLM answering.", "Retrieval-only is available publicly.", rate_state
 
     ok, rate_state, msg = _rate_limit_ok(rate_state)
     if not ok:
@@ -405,9 +409,14 @@ def run_eval(
     max_output_tokens: int,
     golden_path: str,
     rate_state: List[float],
+    access_code: str,
 ):
     if not store:
         return "❌ Build the FAISS index first.", rate_state
+    
+    if not _access_ok(access_code):
+        return "⛔ Access denied. Evaluation is gated to prevent API abuse.", rate_state
+
 
     golden_path = (golden_path or "").strip()
     if not golden_path:
@@ -507,6 +516,12 @@ def api_key_status() -> str:
         "\nSet these in **Space → Settings → Secrets**."
     )
 
+def _access_ok(user_code: str) -> bool:
+    secret = os.getenv("APP_ACCESS_CODE", "").strip()
+    # If no secret is set, we treat it as "open"
+    if not secret:
+        return True
+    return (user_code or "").strip() == secret
 
 with gr.Blocks(title="Research PDF RAG Chatbot (Ticket 5)") as demo:
     gr.Markdown(
@@ -545,6 +560,7 @@ with gr.Blocks(title="Research PDF RAG Chatbot (Ticket 5)") as demo:
 
         with gr.Tab("Ask"):
             gr.Markdown(api_key_status())
+            access_code = gr.Textbox(label="Access code (required for LLM)", type="password", placeholder="Ask Mohammad for the code")
             provider = gr.Dropdown(["auto", "groq", "gemini"], value="auto", label="LLM provider")
             with gr.Row():
                 groq_model = gr.Textbox(label="Groq model", value=GROQ_DEFAULT_MODEL)
@@ -564,6 +580,7 @@ with gr.Blocks(title="Research PDF RAG Chatbot (Ticket 5)") as demo:
                 "**Evaluation uses Gemini-only** to avoid Groq free-tier rate limits.\n\n"
                 "Edit `eval/golden.json` to match your uploaded PDFs for meaningful results."
             )
+            access_code = gr.Textbox(label="Access code (required for LLM)", type="password", placeholder="Ask Mohammad for the code")
             golden_path = gr.Textbox(label="Golden set path", value="eval/golden.json")
             btn_eval = gr.Button("Run evaluation", variant="primary")
             eval_out = gr.Markdown("No eval run yet.")
@@ -584,13 +601,13 @@ with gr.Blocks(title="Research PDF RAG Chatbot (Ticket 5)") as demo:
 
     btn_answer.click(
         fn=rag_answer,
-        inputs=[store_state, question, provider, groq_model, gemini_model, top_k, temperature, max_output_tokens, rate_state],
+        inputs=[store_state, question, provider, groq_model, gemini_model, top_k, temperature, max_output_tokens, rate_state, access_code],
         outputs=[answer_out, retrieval_out, rate_state],
     )
 
     btn_eval.click(
         fn=run_eval,
-        inputs=[store_state, provider, groq_model, gemini_model, top_k, temperature, max_output_tokens, golden_path, rate_state],
+        inputs=[store_state, provider, groq_model, gemini_model, top_k, temperature, max_output_tokens, golden_path, rate_state, access_code],
         outputs=[eval_out, rate_state],
     )
 

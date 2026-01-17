@@ -28,6 +28,15 @@ A fast, end-to-end **PDF RAG chatbot** deployed on **Hugging Face Spaces**.
 
 ---
 
+## Access to LLM features (anti-abuse)
+
+To prevent API abuse and protect free-tier quotas, the **Ask** and **Evaluation** tabs are **access-code gated** (LLM API calls).
+**Retrieval-only functionality (embedding + FAISS search + citations preview) remains public.**
+
+If you would like full access, please email: [mohammad.akhavan999@gmail.com](mailto:mohammad.akhavan999@gmail.com)
+
+---
+
 ## Architecture (minimal)
 
 ```
